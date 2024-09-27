@@ -1,6 +1,5 @@
 node_modules
 .vscode
-lib
 test
 coverage
 samsung-tv-control-*.tgz
