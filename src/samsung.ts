@@ -4,7 +4,7 @@ import * as net from 'net'
 import * as path from 'path'
 import * as request from 'request'
 import * as wol from 'wake_on_lan'
-import * as WebSocket from 'ws'
+import { client as WebSocket, connection } from 'websocket'
 import { KEYS } from './keys'
 import Logger from './logger'
 import { Configuration, WSData, App, Command } from './types'
@@ -18,8 +18,9 @@ import {
   getCommandByKey,
   getSendTextCommand,
 } from './helpers'
+import EventEmitter = require('events')
 
-class Samsung {
+class Samsung extends EventEmitter {
   private IP: string
   private MAC: string
   private PORT: number
@@ -31,8 +32,12 @@ class Samsung {
   private SAVE_TOKEN: boolean
   private TOKEN_FILE = path.join(__dirname, 'token.txt')
   private WS_URL: string
+  private ws: WebSocket
+  private connection?: connection
 
   constructor(config: Configuration) {
+    super();
+
     if (!config.ip) {
       throw new Error('You must provide IP in config')
     }
@@ -60,6 +65,8 @@ class Samsung {
     }
     this.WS_URL = this._getWSUrl()
 
+    this.ws = new WebSocket({ tlsOptions: { rejectUnauthorized: false } });
+
     this.LOGGER.log(
       'internal config',
       {
@@ -73,6 +80,8 @@ class Samsung {
       },
       'constructor',
     )
+
+    this.connect();
   }
 
   public getToken(done: (token: string | null) => void) {
@@ -297,9 +306,10 @@ class Samsung {
           if (!err && res.statusCode === 200) {
             this.LOGGER.log(
               'TV is available',
-              { request: res.request, body: res.body as string, code: res.statusCode },
+              { body: res.body as string, code: res.statusCode },
               'isAvailable',
             )
+
             resolve(true)
           } else {
             this.LOGGER.error('TV is not available', { err }, 'isAvailable')
@@ -350,59 +360,99 @@ class Samsung {
     // backward compatibility
   }
 
+  private reconnect() {
+    this.LOGGER.log('connecting to ' + this.WS_URL, '');
+    this.ws.connect(this.WS_URL);
+  }
+
+  public ready(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.on('ready', () => resolve())
+    });
+  }
+
+  private connect() {
+    this.reconnect();
+
+    this.ws.on('connect', (connection) => {
+      this.LOGGER.log('connected', 'ws.on connect');
+      this.connection = connection;
+      this.emit('connect')
+
+      connection.on('message', (message) => {
+        if (message.type != "utf8") return;
+        const data: WSData = JSON.parse(message.utf8Data);
+        this.emit('data', data)
+
+        this.LOGGER.log('data: ', JSON.stringify(data, null, 2), 'ws.on message')
+
+        if (data.event !== 'ms.channel.connect') {
+          this.LOGGER.log('if not correct event', JSON.stringify(data, null, 2), 'ws.on message')
+        }
+
+        if (data.event == "ms.channel.connect") {
+          this.emit('ready');
+
+          const token = data?.data?.token;
+          if (token) {
+            const sToken = String(token)
+            this.LOGGER.log('got token', sToken, 'getToken')
+            this.TOKEN = sToken
+            this.WS_URL = this._getWSUrl()
+
+            if (this.SAVE_TOKEN) {
+              this._saveTokenToFile(sToken)
+            }
+
+            connection.close();
+          }
+        }
+      })
+
+      connection.on('close', () => {
+        this.emit('close')
+        this.LOGGER.log('', '', 'ws.on close');
+        setTimeout(() => this.reconnect(), 1000);
+      })
+
+      connection.on('error', (err) => {
+        let errorMsg = ''
+        if (err.message === 'EHOSTUNREACH' || err.message === 'ECONNREFUSED') {
+          errorMsg = 'TV is off or unavailable'
+        }
+        console.error(errorMsg, err)
+        this.LOGGER.error(errorMsg, err, 'ws.on error')
+      })
+    })
+  }
+
   private _send(
     command: Command,
-    done?: (err: null | (Error & { code: string }), res: WSData | null) => void,
+    done?: (err: null | (Error), res: WSData | null) => void,
     eventHandle?: string,
   ) {
-    const ws = new WebSocket(this.WS_URL, { rejectUnauthorized: false })
+    if (this.connection?.state != 'open') return;
 
-    this.LOGGER.log('command', command, '_send')
-    this.LOGGER.log('wsUrl', this.WS_URL, '_send')
+    function rejected(err?: Error) {
+      if (done && err) done(err, null);
+    }
 
-    ws.on('open', () => {
-      if (this.PORT === 8001) {
-        setTimeout(() => ws.send(JSON.stringify(command)), 1000)
-      } else {
-        ws.send(JSON.stringify(command))
-        setTimeout(() => ws.close(), 250);
+    if (done) {
+      let timeout = setTimeout(() => {
+        this.removeListener('data', listener);
+        done(null, null)
+      }, 3000);
+
+      const listener = (d: WSData) => {
+        clearTimeout(timeout);
+        this.removeListener('data', listener)
+        done(null, d);
       }
-    })
+      this.on('data', listener);
+    }
 
-    ws.on('message', (message: string) => {
-      const data: WSData = JSON.parse(message)
-
-      this.LOGGER.log('data: ', JSON.stringify(data, null, 2), 'ws.on message')
-
-      if (done && (data.event === command.params.event || data.event === eventHandle)) {
-        this.LOGGER.log('if correct event', JSON.stringify(data, null, 2), 'ws.on message')
-        done(null, data)
-      }
-
-      if (data.event !== 'ms.channel.connect') {
-        this.LOGGER.log('if not correct event', JSON.stringify(data, null, 2), 'ws.on message')
-        ws.close()
-      }
-
-      // TODO, additional check on available instead of ws.open
-      // if(data.event == "ms.channel.connect") { _sendCMD() }
-    })
-
-    ws.on('response', (response: WebSocket.Data) => {
-      this.LOGGER.log('response', response, 'ws.on response')
-    })
-
-    ws.on('error', (err: Error & { code: string }) => {
-      let errorMsg = ''
-      if (err.code === 'EHOSTUNREACH' || err.code === 'ECONNREFUSED') {
-        errorMsg = 'TV is off or unavailable'
-      }
-      console.error(errorMsg)
-      this.LOGGER.error(errorMsg, err, 'ws.on error')
-      if (done) {
-        done(err, null)
-      }
-    })
+    this.LOGGER.log('sending cmd', '');
+    this.connection?.send(JSON.stringify(command), rejected);
   }
 
   private _sendPromise(command: Command, eventHandle?: string): Promise<WSData | null> {
